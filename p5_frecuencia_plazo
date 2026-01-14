@@ -1,0 +1,154 @@
+ procedure p5_frecuencia_plazo(p_securitizadora in number,
+                                p_administrador  in number,
+                                p_patrimonio     in number,
+                                p_fecha          in number,
+                                p_salida         in out number,
+                                p_mensaje        in out varchar2) is
+  
+    pragma autonomous_transaction;
+  
+    l_id_patrimonio number;
+    l_id_rango      number;
+    l_eliminados    number := 0;
+    l_insertados    number := 0;
+    l_inicio        timestamp;
+    l_fin           timestamp;
+  
+  begin
+    l_inicio  := systimestamp;
+    p_salida  := 0;
+    p_mensaje := null;
+  
+    dbms_output.put_line('===============================================');
+    dbms_output.put_line('    BI-FRECUENCIA PLAZO REMANENTE');
+    dbms_output.put_line('===============================================');
+    dbms_output.put_line('Fecha/Hora inicio: ' || to_char(l_inicio, 'dd-mm-yyyy hh24:mi:ss'));
+    dbms_output.put_line('Parámetros:');
+    dbms_output.put_line('  - Securitizadora: ' || p_securitizadora);
+    dbms_output.put_line('  - Administrador: ' || p_administrador);
+    dbms_output.put_line('  - Patrimonio: ' || p_patrimonio);
+    dbms_output.put_line('  - Fecha: ' || p_fecha);
+    dbms_output.put_line('-----------------------------------------------');
+  
+    -- ============================================================
+    -- PASO 1: Obtener ID del patrimonio y rango
+    -- ============================================================
+    begin
+      select pat.id_patrimonio, pat.id_rango
+        into l_id_patrimonio, l_id_rango
+        from dim_patrimonio pat
+       where pat.rut_securitizadora = p_securitizadora
+         and pat.rut_patrimonio = p_patrimonio
+         and pat.rut_adm_primario = p_administrador
+         and rownum = 1;
+    
+      dbms_output.put_line('ID Patrimonio: ' || l_id_patrimonio);
+      dbms_output.put_line('ID Rango: ' || l_id_rango);
+    
+    exception
+      when no_data_found then
+        p_salida  := -1;
+        p_mensaje := 'No se encontró patrimonio para los parámetros ingresados';
+        dbms_output.put_line('ERROR: ' || p_mensaje);
+        rollback;
+        return;
+    end;
+  
+    -- ============================================================
+    -- PASO 2: Eliminar datos existentes
+    -- ============================================================
+    delete from fact_frecuencia_plz_remanente
+     where id_fecha = p_fecha
+       and id_patrimonio = l_id_patrimonio;
+  
+    l_eliminados := sql%rowcount;
+    dbms_output.put_line('Registros eliminados: ' || l_eliminados);
+  
+    -- ============================================================
+    -- PASO 3: Insertar nuevos datos (INSERT DIRECTO)
+    -- ============================================================
+    insert into fact_frecuencia_plz_remanente
+      (id_fecha,
+       id_patrimonio,
+       id_rngo_plz_remanente,
+       id_estado_securitizado,
+       id_transaccion,
+       id_rngo_mora,
+       id_tipo_moneda,
+       id_tipo_cartera,
+       cant_creditos,
+       saldo_final)
+      select sal.fecha_key as id_fecha,
+             l_id_patrimonio as id_patrimonio,
+             dim.id_rngo_plz_remanente as id_rngo_plz_remanente,
+             2 as id_estado_securitizado,
+             c.id_transaccion as id_transaccion,
+             sal.rango_mora as id_rngo_mora,
+             sal.id_tipo_moneda as id_tipo_moneda,
+             sal.tipo_cartera as id_tipo_cartera,
+             sum(case
+                   when sal.sec_rut = 96858720 and sal.adp_rut = 120427162 then
+                    nvl(sal.cred_final, 0)
+                   when c.id_transaccion = 14 then
+                    nvl(sal.cred_alta, 0) + nvl(sal.cred_revivido, 0)
+                   else
+                    0
+                 end) as cant_creditos,
+             sum(case
+                   when c.id_transaccion <> 14 then
+                    nvl(sal.sdm_saldo_final, 0)
+                   else
+                    0
+                 end) as saldo_final
+        from dw_saldo_documental sal
+       inner join dim_transaccion c on sal.desc_tx_interna = c.desc_transaccion
+       inner join dim_rngo_plz_remanente dim on dim.id_rel_rango = l_id_rango
+      /*    and fnc_busca_rango_plazo(
+                                                                                                                                                                                        round((sal.sdm_fecha_vencimiento - sal.sdm_fecha_cierre) /
+                                                                                                                                                                                              365.25,
+                                                                                                                                                                                              6),
+                                                                                                                                                                                        l_id_rango) = dim.cod_rngo_plazo*/
+       where sal.sec_rut = p_securitizadora
+         and sal.adp_rut = p_administrador
+         and sal.pat_rut = p_patrimonio
+         and sal.fecha_key = p_fecha
+       group by sal.fecha_key, dim.id_rngo_plz_remanente, c.id_transaccion, sal.rango_mora, sal.id_tipo_moneda, sal.tipo_cartera
+       order by 1, 2, 3, 4, 5, 6, 7;
+  
+    l_insertados := sql%rowcount;
+  
+    -- Commit único al final
+    commit;
+  
+    l_fin := systimestamp;
+  
+    -- ============================================================
+    -- PASO 4: Mensajes de salida
+    -- ============================================================
+    dbms_output.put_line('-----------------------------------------------');
+    dbms_output.put_line('REGISTROS ELIMINADOS: ' || l_eliminados);
+    dbms_output.put_line('REGISTROS INSERTADOS: ' || l_insertados);
+    dbms_output.put_line('Tiempo ejecución: ' || round(extract(second from(l_fin - l_inicio)), 2) || ' segundos');
+    dbms_output.put_line('===============================================');
+    dbms_output.put_line('PROCESO FINALIZADO EXITOSAMENTE');
+    dbms_output.put_line('===============================================');
+  
+    p_salida  := l_insertados;
+    p_mensaje := 'Cargada Fact-Frecuencia-Plazo Remanente: ' || l_insertados || ' registros';
+  
+  exception
+    when others then
+      rollback;
+    
+      p_salida  := sqlcode;
+      p_mensaje := 'ERROR: ' || sqlerrm;
+    
+      dbms_output.put_line('===============================================');
+      dbms_output.put_line('ERROR EN BI-FRECUENCIA PLAZO REMANENTE');
+      dbms_output.put_line('===============================================');
+      dbms_output.put_line('PERIODO: ' || p_fecha);
+      dbms_output.put_line('SQLCODE: ' || sqlcode);
+      dbms_output.put_line('SQLERRM: ' || sqlerrm);
+      dbms_output.put_line('===============================================');
+    
+  end p5_frecuencia_plazo;
