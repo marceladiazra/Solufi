@@ -1,0 +1,504 @@
+procedure p1_traspaso_fact_saldos(p_securitizadora in number,
+                                    p_administrador  in number,
+                                    p_patrimonio     in number,
+                                    p_fecha          in number,
+                                    p_salida         in out number,
+                                    p_mensaje        in out varchar2) is
+    -- Variables de control
+    l_id_patrimonio        number;
+    l_registros_procesados number := 0;
+    l_registros_error      number := 0;
+    l_inicio               timestamp := systimestamp;
+    l_sqlcode              number;
+    l_sqlerrm              varchar2(4000);
+  
+    -- Excepciones personalizadas
+    e_validacion_params exception;
+    e_patrimonio_no_existe exception;
+    e_sin_datos exception;
+  
+  begin
+    -- =========================================================================
+    -- PASO 1: VALIDACIÓN DE PARÁMETROS
+    -- =========================================================================
+    if p_securitizadora is null or p_administrador is null or p_patrimonio is null or p_fecha is null then
+      raise e_validacion_params;
+    end if;
+  
+    -- Validar formato de fecha (debe ser YYYYMMDD válido)
+    if length(to_char(p_fecha)) != 8 then
+      raise e_validacion_params;
+    end if;
+  
+    -- =========================================================================
+    -- PASO 2: OBTENER ID_PATRIMONIO
+    -- =========================================================================
+    begin
+      select id_patrimonio
+        into l_id_patrimonio
+        from dim_patrimonio
+       where rut_securitizadora = p_securitizadora
+         and rut_adm_primario = p_administrador
+         and rut_patrimonio = p_patrimonio;
+    exception
+      when no_data_found then
+        raise e_patrimonio_no_existe;
+    end;
+  
+    delete from fact_saldo_documental
+     where id_fecha = p_fecha
+       and id_patrimonio = l_id_patrimonio;
+    commit;
+  
+    -- =========================================================================
+    -- PASO 3: ACTUALIZAR DIMENSIÓN DE ZONA GEOGRÁFICA (si es necesario)
+    -- =========================================================================
+    -- NOTA: Las dimensiones deben cargarse ANTES por proceso ETL separado
+    -- Este código solo valida que existan las zonas geográficas necesarias
+    -- Si faltan zonas, el proceso continuará pero registrará WARNING
+    begin
+      -- Verificar si existen zonas geográficas faltantes
+      declare
+        l_zonas_faltantes number;
+      begin
+        select count(distinct nvl(upper(desc_local_apertura), 'SIN INFORMACION'))
+          into l_zonas_faltantes
+          from dw_saldo_documental dw
+         where dw.sec_rut = p_securitizadora
+           and dw.adp_rut = p_administrador
+           and dw.pat_rut = p_patrimonio
+           and dw.fecha_key = p_fecha
+           and not exists (select 1
+                  from dim_zona_geografica dzg
+                 where upper(dzg.nom_localidad) = nvl(upper(dw.desc_local_apertura), 'SIN INFORMACION'));
+      
+        if l_zonas_faltantes > 0 then
+          dbms_output.put_line('WARNING: Existen ' || l_zonas_faltantes || ' zonas geográficas faltantes en dim_zona_geografica');
+          dbms_output.put_line('         El proceso continuará, pero algunos registros pueden quedar sin zona asignada');
+          -- No fallar el proceso, continuar con las zonas existentes
+        end if;
+      end;
+    exception
+      when others then
+        l_sqlcode := sqlcode;
+        l_sqlerrm := sqlerrm;
+        -- Log pero no fallar el proceso completo
+        dbms_output.put_line('WARNING: Error validando dim_zona_geografica: ' || l_sqlerrm);
+    end;
+  
+    -- =========================================================================
+    -- PASO 4: CARGA MASIVA CON MERGE (Reemplaza DELETE + INSERT)
+    -- =========================================================================
+    begin
+      merge into fact_saldo_documental f
+      using (
+             -- Subconsulta optimizada (una sola pasada por los datos)
+             select
+             -- Dimensiones
+              dw.fecha_key as id_fecha,
+               dp.id_patrimonio,
+               nvl(dtx.id_tipo_tx, 2) as id_transaccion,
+               dw.rango_mora as id_rngo_mora,
+               nvl(to_number(to_char(dw.cli_fecha_compra, 'YYYYMMDD')), 29000101) as fecha_venta,
+               nvl(to_number(to_char(dw.neg_fecha_proceso, 'YYYYMMDD')), 29000101) as fecha_proceso,
+               dzg.id_zona_geografica,
+               dw.tipo_cartera as id_tipo_cartera,
+               dea.id_estado_activo,
+               0 as id_documento,
+               dm.id_tipo_moneda as id_tipo_moneda_origen,
+               nvl(dw.desc_giro_comercial, '0') as desc_clasificacion,
+               dm.id_tipo_moneda as id_moneda_origen,
+               
+               -- Métricas agregadas
+               nvl(sum(dw.sdm_saldo_inicial), 0) as saldo_inicial,
+               nvl(sum(dw.sdm_pagos), 0) as pagos,
+               nvl(sum(dw.sdm_abonos), 0) as abonos,
+               nvl(sum(dw.sdm_cargos), 0) as cargos,
+               nvl(sum(dw.sdm_egresos), 0) as egresos,
+               nvl(sum(dw.sdm_ventas), 0) as ventas,
+               nvl(sum(dw.sdm_nc), 0) as nota_credito,
+               nvl(sum(dw.incorporacion), 0) as incorporacion,
+               nvl(sum(dw.enagenacion), 0) as enagenacion,
+               nvl(sum(dw.sdm_ajustes), 0) as ajustes,
+               nvl(sum(dw.sdm_saldo_final), 0) as saldo_final,
+               
+               -- Valores documentales/negocio (optimizado con flag calculado una vez)
+               sum(case
+                     when dw.sdm_fecha_venta <= to_date(to_char(dw.fecha_key), 'YYYYMMDD') then
+                      dw.sdm_valor_presente
+                     else
+                      0
+                   end) as valor_presente_documental,
+               sum(case
+                     when dw.sdm_fecha_venta <= to_date(to_char(dw.fecha_key), 'YYYYMMDD') then
+                      dw.sdm_valor_par
+                     else
+                      0
+                   end) as valor_par_documental,
+               sum(case
+                     when dw.sdm_fecha_venta <= to_date(to_char(dw.fecha_key), 'YYYYMMDD') then
+                      dw.neg_valor_par
+                     else
+                      0
+                   end) as valor_par_negocio,
+               sum(case
+                     when dw.sdm_fecha_venta <= to_date(to_char(dw.fecha_key), 'YYYYMMDD') then
+                      dw.neg_valor_presente
+                     else
+                      0
+                   end) as valor_presente_negocio,
+               sum(case
+                     when dw.sdm_fecha_venta <= to_date(to_char(dw.fecha_key), 'YYYYMMDD') then
+                      dw.sdm_cuenta_por_cobrar
+                     else
+                      0
+                   end) as cuenta_por_cobrar,
+               sum(case
+                     when dw.sdm_fecha_venta <= to_date(to_char(dw.fecha_key), 'YYYYMMDD') then
+                      dw.sdm_cuenta_por_pagar
+                     else
+                      0
+                   end) as cuenta_por_pagar,
+               
+               -- Otras métricas
+               nvl(sum(dw.monto_financiado), 0) as monto_financiado,
+               nvl(sum(dw.neg_monto_residual), 0) as monto_residual,
+               nvl(sum(dw.neg_monto_vencido), 0) as monto_vencido,
+               nvl(sum(dw.neg_cuotas_pagadas_inf), 0) as cuotas_pagadas_inf,
+               nvl(sum(dw.neg_cuotas_securitizadas), 0) as cuotas_securitizadas,
+               nvl(sum(dw.neg_cuotas_vendidas_inf), 0) as cuotas_vendidas_inf,
+               sum(dw.neg_devengo_diario) as devengo_diario,
+               nvl(sum(dw.neg_diferencia_precio), 0) as diferencia_precio,
+               count(dw.neg_ind_custodia) as ind_custodia,
+               nvl(sum(dw.neg_monto_tipo_cambio), 0) as monto_tipo_cambio,
+               nvl(sum(dw.neg_saldo_negocio_inf), 0) as saldo_negocio_inf,
+               nvl(sum(dw.neg_valor_cuota_distinta), 0) as valor_cuota_distinta,
+               nvl(sum(dw.neg_valor_cuota_pactada), 0) as valor_cuota_pactada,
+               
+               -- Plazo remanente calculado
+               sum(case
+                     when (dw.sdm_fecha_vencimiento - dw.sdm_fecha_cierre <= 0) or trunc(dw.sdm_saldo_final) = 0 then
+                      0
+                     else
+                      (dw.sdm_fecha_vencimiento - dw.sdm_fecha_cierre) * dw.sdm_saldo_final / 30
+                   end) / nullif(sum(dw.sdm_saldo_final), 0) as plz_remanente,
+               
+               -- Contadores de negocios (lógica Solufi parametrizada)
+               sum(dw.cred_incorporacion) as nro_neg_incorporacion,
+               sum(dw.cred_enajenacion) as nro_neg_enajenacion,
+               sum(dw.cred_alta) as nro_neg_originado,
+               sum(dw.cred_baja) as nro_neg_baja,
+               
+               -- Lógica especial Solufi
+               case
+                 when dw.sec_rut = 96858720 and dw.adp_rut = 120427162 then
+                  sum(dw.cred_inicial)
+                 else
+                  sum(dw.cred_revivido)
+               end as nro_neg_inicial,
+               
+               case
+                 when dw.sec_rut = 96858720 and dw.adp_rut = 120427162 then
+                  sum(dw.cred_final)
+                 else
+                  sum(dw.cred_alta + dw.cred_revivido)
+               end as nro_neg_final
+             
+               from dw_saldo_documental dw
+             
+             -- JOINs optimizados (usando hints si es necesario)
+              inner join dim_patrimonio dp on dw.sec_rut = dp.rut_securitizadora
+                                          and dw.adp_rut = dp.rut_adm_primario
+                                          and dw.pat_rut = dp.rut_patrimonio
+             
+               left join dim_tipo_tx dtx on dtx.desc_transaccion = dw.desc_tx_interna
+             
+               left join dim_zona_geografica dzg on upper(dzg.nom_localidad) =
+                                                    nvl(upper(dw.desc_local_apertura), 'SIN INFORMACION')
+             
+               left join dim_estado_activo dea on upper(dea.desc_larga_estado_activo) = upper(dw.desc_vigencia)
+             
+               left join dim_monedas dm on dm.desc_corta_moneda = nvl(dw.moneda_origen, 'PEN')
+             
+             -- Filtros de parámetros
+              where dw.sec_rut = p_securitizadora
+                and dw.adp_rut = p_administrador
+                and dw.pat_rut = p_patrimonio
+                and dw.fecha_key = p_fecha
+             
+              group by dw.fecha_key,
+                        dp.id_patrimonio,
+                        dtx.id_tipo_tx,
+                        dw.rango_mora,
+                        to_number(to_char(dw.cli_fecha_compra, 'YYYYMMDD')),
+                        to_number(to_char(dw.neg_fecha_proceso, 'YYYYMMDD')),
+                        dzg.id_zona_geografica,
+                        dw.tipo_cartera,
+                        dea.id_estado_activo,
+                        dw.desc_giro_comercial,
+                        dm.id_tipo_moneda,
+                        dw.sec_rut,
+                        dw.adp_rut) src
+      on (f.id_fecha = src.id_fecha and f.id_patrimonio = src.id_patrimonio and f.id_transaccion = src.id_transaccion and f.id_rngo_mora = src.id_rngo_mora and f.fecha_venta = src.fecha_venta and f.fecha_proceso = src.fecha_proceso and f.id_zona_geografica = src.id_zona_geografica and f.id_tipo_cartera = src.id_tipo_cartera and f.id_estado_activo = src.id_estado_activo and f.id_documento = src.id_documento and f.id_tipo_moneda_origen = src.id_tipo_moneda_origen and f.desc_clasificacion = src.desc_clasificacion)
+      when matched then
+        update
+           set f.saldo_inicial             = src.saldo_inicial,
+               f.pagos                     = src.pagos,
+               f.abonos                    = src.abonos,
+               f.cargos                    = src.cargos,
+               f.egresos                   = src.egresos,
+               f.incorporacion             = src.incorporacion,
+               f.enagenacion               = src.enagenacion,
+               f.ajustes                   = src.ajustes,
+               f.saldo_final               = src.saldo_final,
+               f.valor_presente_documental = src.valor_presente_documental,
+               f.valor_par_documental      = src.valor_par_documental,
+               f.valor_par_negocio         = src.valor_par_negocio,
+               f.valor_presente_negocio    = src.valor_presente_negocio,
+               f.cuenta_por_cobrar         = src.cuenta_por_cobrar,
+               f.cuenta_por_pagar          = src.cuenta_por_pagar,
+               f.monto_financiado          = src.monto_financiado,
+               f.monto_residual            = src.monto_residual,
+               f.monto_vencido             = src.monto_vencido,
+               f.cuotas_pagadas_inf        = src.cuotas_pagadas_inf,
+               f.cuotas_securitizadas      = src.cuotas_securitizadas,
+               f.cuotas_vendidas_inf       = src.cuotas_vendidas_inf,
+               f.devengo_diario            = src.devengo_diario,
+               f.diferencia_precio         = src.diferencia_precio,
+               f.ind_custodia              = src.ind_custodia,
+               f.monto_tipo_cambio         = src.monto_tipo_cambio,
+               f.saldo_negocio_inf         = src.saldo_negocio_inf,
+               f.valor_cuota_distinta      = src.valor_cuota_distinta,
+               f.valor_cuota_pactada       = src.valor_cuota_pactada,
+               f.ventas                    = src.ventas,
+               f.nota_credito              = src.nota_credito,
+               f.plz_remanente             = src.plz_remanente,
+               f.id_moneda_origen          = src.id_moneda_origen,
+               f.nro_neg_incorporacion     = src.nro_neg_incorporacion,
+               f.nro_neg_enajenacion       = src.nro_neg_enajenacion,
+               f.nro_neg_originado         = src.nro_neg_originado,
+               f.nro_neg_inicial           = src.nro_neg_inicial,
+               f.nro_neg_baja              = src.nro_neg_baja,
+               f.nro_neg_final             = src.nro_neg_final
+      when not matched then
+        insert
+          (id_fecha,
+           id_patrimonio,
+           id_transaccion,
+           id_rngo_mora,
+           fecha_venta,
+           fecha_proceso,
+           id_zona_geografica,
+           id_tipo_cartera,
+           id_estado_activo,
+           id_documento,
+           id_tipo_moneda_origen,
+           desc_clasificacion,
+           saldo_inicial,
+           pagos,
+           abonos,
+           cargos,
+           egresos,
+           incorporacion,
+           enagenacion,
+           ajustes,
+           saldo_final,
+           valor_presente_documental,
+           valor_par_documental,
+           valor_par_negocio,
+           valor_presente_negocio,
+           cuenta_por_cobrar,
+           cuenta_por_pagar,
+           monto_financiado,
+           monto_residual,
+           monto_vencido,
+           cuotas_pagadas_inf,
+           cuotas_securitizadas,
+           cuotas_vendidas_inf,
+           devengo_diario,
+           diferencia_precio,
+           ind_custodia,
+           monto_tipo_cambio,
+           saldo_negocio_inf,
+           valor_cuota_distinta,
+           valor_cuota_pactada,
+           ventas,
+           nota_credito,
+           plz_remanente,
+           num_operacion,
+           nro_neg_negativo,
+           id_moneda_origen,
+           nro_neg_incorporacion,
+           nro_neg_enajenacion,
+           nro_neg_originado,
+           nro_neg_inicial,
+           nro_neg_baja,
+           nro_neg_final)
+        values
+          (src.id_fecha,
+           src.id_patrimonio,
+           src.id_transaccion,
+           src.id_rngo_mora,
+           src.fecha_venta,
+           src.fecha_proceso,
+           src.id_zona_geografica,
+           src.id_tipo_cartera,
+           src.id_estado_activo,
+           src.id_documento,
+           src.id_tipo_moneda_origen,
+           src.desc_clasificacion,
+           src.saldo_inicial,
+           src.pagos,
+           src.abonos,
+           src.cargos,
+           src.egresos,
+           src.incorporacion,
+           src.enagenacion,
+           src.ajustes,
+           src.saldo_final,
+           src.valor_presente_documental,
+           src.valor_par_documental,
+           src.valor_par_negocio,
+           src.valor_presente_negocio,
+           src.cuenta_por_cobrar,
+           src.cuenta_por_pagar,
+           src.monto_financiado,
+           src.monto_residual,
+           src.monto_vencido,
+           src.cuotas_pagadas_inf,
+           src.cuotas_securitizadas,
+           src.cuotas_vendidas_inf,
+           src.devengo_diario,
+           src.diferencia_precio,
+           src.ind_custodia,
+           src.monto_tipo_cambio,
+           src.saldo_negocio_inf,
+           src.valor_cuota_distinta,
+           src.valor_cuota_pactada,
+           src.ventas,
+           src.nota_credito,
+           src.plz_remanente,
+           0,
+           0,
+           src.id_moneda_origen,
+           src.nro_neg_incorporacion,
+           src.nro_neg_enajenacion,
+           src.nro_neg_originado,
+           src.nro_neg_inicial,
+           src.nro_neg_baja,
+           src.nro_neg_final);
+    
+      l_registros_procesados := sql%rowcount;
+    
+      if l_registros_procesados = 0 then
+        raise e_sin_datos;
+      end if;
+    
+    exception
+      when others then
+        l_sqlcode := sqlcode;
+        l_sqlerrm := sqlerrm;
+      
+        -- Log detallado del error mediante DBMS_OUTPUT
+        dbms_output.put_line('========================================');
+        dbms_output.put_line('ERROR EN MERGE - FACT_SALDO_DOCUMENTAL');
+        dbms_output.put_line('========================================');
+        dbms_output.put_line('PATRIMONIO: ' || l_id_patrimonio);
+        dbms_output.put_line('FECHA: ' || p_fecha);
+        dbms_output.put_line('SQLCODE: ' || l_sqlcode);
+        dbms_output.put_line('SQLERRM: ' || l_sqlerrm);
+        dbms_output.put_line('BACKTRACE: ' || dbms_utility.format_error_backtrace);
+        dbms_output.put_line('========================================');
+      
+        raise; -- Re-lanzar excepción para rollback
+    end;
+  
+    -- =========================================================================
+    -- PASO 5: COMMIT ÚNICO Y FINAL (Transacción atómica)
+    -- =========================================================================
+    commit;
+  
+    -- =========================================================================
+    -- PASO 6: REPORTE DE EJECUCIÓN EXITOSA
+    -- =========================================================================
+    p_salida  := 0;
+    p_mensaje := 'Proceso exitoso. Registros procesados: ' || l_registros_procesados;
+  
+    -- Output informativo
+    dbms_output.put_line('========================================');
+    dbms_output.put_line('BI - FACT_SALDO_DOCUMENTAL - PERIODO: ' || p_fecha);
+    dbms_output.put_line('========================================');
+    dbms_output.put_line('PATRIMONIO: ' || l_id_patrimonio);
+    dbms_output.put_line('REGISTROS PROCESADOS: ' || l_registros_procesados);
+    dbms_output.put_line('ESTADO: EXITOSO');
+    dbms_output.put_line('========================================');
+  
+  exception
+    -- =========================================================================
+    -- MANEJO DE EXCEPCIONES CON SQLCODE Y SQLERRM
+    -- =========================================================================
+    when e_validacion_params then
+      rollback;
+      l_sqlcode := -20001; -- Código customizado para validación
+      l_sqlerrm := 'Parámetros de entrada inválidos o nulos';
+      p_salida  := l_sqlcode;
+      p_mensaje := l_sqlerrm;
+    
+      dbms_output.put_line('========================================');
+      dbms_output.put_line('ERROR: VALIDACIÓN DE PARÁMETROS');
+      dbms_output.put_line('========================================');
+      dbms_output.put_line('MENSAJE: ' || l_sqlerrm);
+      dbms_output.put_line('SECURITIZADORA: ' || nvl(to_char(p_securitizadora), 'NULL'));
+      dbms_output.put_line('ADMINISTRADOR: ' || nvl(to_char(p_administrador), 'NULL'));
+      dbms_output.put_line('PATRIMONIO: ' || nvl(to_char(p_patrimonio), 'NULL'));
+      dbms_output.put_line('FECHA: ' || nvl(to_char(p_fecha), 'NULL'));
+      dbms_output.put_line('========================================');
+    
+    when e_patrimonio_no_existe then
+      rollback;
+      l_sqlcode := -20002; -- Código customizado
+      l_sqlerrm := 'Patrimonio no encontrado para SEC:' || p_securitizadora || ' ADP:' || p_administrador || ' PAT:' ||
+                   p_patrimonio;
+      p_salida  := l_sqlcode;
+      p_mensaje := l_sqlerrm;
+    
+      dbms_output.put_line('========================================');
+      dbms_output.put_line('ERROR: PATRIMONIO NO EXISTE');
+      dbms_output.put_line('========================================');
+      dbms_output.put_line('MENSAJE: ' || l_sqlerrm);
+      dbms_output.put_line('========================================');
+    
+    when e_sin_datos then
+      rollback;
+      l_sqlcode := -20003; -- Código customizado
+      l_sqlerrm := 'No se encontraron datos para procesar con los parámetros proporcionados';
+      p_salida  := l_sqlcode;
+      p_mensaje := l_sqlerrm;
+    
+      dbms_output.put_line('========================================');
+      dbms_output.put_line('ERROR: SIN DATOS PARA PROCESAR');
+      dbms_output.put_line('========================================');
+      dbms_output.put_line('MENSAJE: ' || l_sqlerrm);
+      dbms_output.put_line('PATRIMONIO: ' || l_id_patrimonio);
+      dbms_output.put_line('FECHA: ' || p_fecha);
+      dbms_output.put_line('========================================');
+    
+    when others then
+      rollback;
+      l_sqlcode := sqlcode;
+      l_sqlerrm := sqlerrm;
+      p_salida  := l_sqlcode;
+      p_mensaje := 'Error inesperado - SQLCODE: ' || l_sqlcode || ' - ' || substr(l_sqlerrm, 1, 200);
+    
+      dbms_output.put_line('========================================');
+      dbms_output.put_line('ERROR CRÍTICO EN PROCESO');
+      dbms_output.put_line('========================================');
+      dbms_output.put_line('PATRIMONIO: ' || nvl(to_char(l_id_patrimonio), 'NULL'));
+      dbms_output.put_line('FECHA: ' || p_fecha);
+      dbms_output.put_line('SQLCODE: ' || l_sqlcode);
+      dbms_output.put_line('SQLERRM: ' || l_sqlerrm);
+      dbms_output.put_line('BACKTRACE: ' || dbms_utility.format_error_backtrace);
+      dbms_output.put_line('ERROR_STACK: ' || dbms_utility.format_error_stack);
+      dbms_output.put_line('========================================');
+    
+  end p1_traspaso_fact_saldos;
