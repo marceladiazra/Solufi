@@ -1,0 +1,234 @@
+procedure p2_matriz_transicion(p_securitizadora in number,
+                                 p_administrador  in number,
+                                 p_patrimonio     in number,
+                                 p_fecha          number,
+                                 p_salida         in out number,
+                                 p_mensaje        in out varchar2) is
+  
+    pragma autonomous_transaction;
+    type array_object is table of tmp_dw_saldo_doc%rowtype index by binary_integer;
+    lr_datos array_object;
+  
+    type fles_rowid_tab is table of rowid;
+    fles_rowid fles_rowid_tab;
+  
+    l_array_size       pls_integer := 4000;
+    l_filas_insertadas number;
+    l_filas_eliminadas number;
+    l_filas_borradas   number;
+    l_insertados       number;
+    l_errores          number;
+    l_datos            number;
+    l_actualiza        number;
+    l_error            number;
+    l_id_patrimonio    number;
+  
+    cursor c_eliminar is
+      select rowid
+        from tmp_dw_saldo_doc
+       where sec_rut = p_securitizadora
+         and pat_rut = p_patrimonio
+         and adp_rut = p_administrador;
+  
+    cursor c_poblar is
+      select fecha_key,
+             sec_rut,
+             adp_rut,
+             pat_rut,
+             cli_codigo,
+             cli_identificacion,
+             neg_documento,
+             sdm_documento,
+             rango_mora,
+             tipo_cartera,
+             sdm_fecha_cierre,
+             sdm_saldo_inicial,
+             sdm_saldo_final
+        from dw_saldo_documental sal
+       where sal.fecha_key between to_char(add_months(to_date(to_char(p_fecha), 'RRRRMMDD'), -1), 'RRRRMMDD') and p_fecha
+         and sal.sec_rut = p_securitizadora
+         and sal.adp_rut = p_administrador
+         and sal.pat_rut = p_patrimonio
+         and sdm_documento like '%OP';
+    --funciona para menorca * /
+    -- and desc_tx_interna = 'CAPITAL'; /*Funciona para Principal*/
+  
+    cursor c_dw_saldos_doc is
+      select sal.fecha_key id_fecha,
+             pat.id_patrimonio id_patrimonio,
+             sal2.rango_mora id_rango_ant,
+             count(distinct sal.cli_codigo) numero_creditos,
+             sum(case
+                   when sal.sdm_saldo_final <> 0 then
+                    1
+                   else
+                    0
+                 end) doc_vigentes,
+             sum(case
+                   when sal.rango_mora > sal2.rango_mora then
+                    1
+                   else
+                    0
+                 end) val_cred_decaen,
+             sum(case
+                   when sal.rango_mora = sal2.rango_mora then
+                    1
+                   else
+                    0
+                 end) val_cred_mantienen,
+             sum(case
+                   when sal.rango_mora < sal2.rango_mora then
+                    1
+                   else
+                    0
+                 end) val_cred_mejoran
+        from tmp_dw_saldo_doc sal, tmp_dw_saldo_doc sal2, dim_patrimonio pat
+       where sal.fecha_key = p_fecha
+         and sal.sec_rut = sal2.sec_rut
+         and sal.adp_rut = sal2.adp_rut
+         and sal.pat_rut = sal2.pat_rut
+         and sal2.cli_codigo = sal.cli_codigo
+         and sal2.cli_identificacion = sal.cli_identificacion
+         and sal2.neg_documento = sal.neg_documento
+         and sal2.sdm_documento = sal.sdm_documento
+         and sal2.tipo_cartera = sal.tipo_cartera
+         and pat.rut_securitizadora = sal.sec_rut
+         and pat.rut_adm_primario = sal.adp_rut
+         and pat.rut_patrimonio = sal.pat_rut
+         and sal2.fecha_key = to_number(to_char(add_months(to_date(sal.fecha_key, 'RRRRMMDD'), -1), 'RRRRMMDD'))
+         and substr(to_char(sal.fecha_key), 7, 2) > 25
+         and sal.sec_rut = p_securitizadora
+         and sal.adp_rut = p_administrador
+         and sal.pat_rut = p_patrimonio
+       group by sal.fecha_key, pat.id_patrimonio, sal2.rango_mora;
+  
+  begin
+  
+    l_insertados       := 0;
+    l_errores          := 0;
+    l_datos            := 0;
+    l_actualiza        := 0;
+    l_error            := 0;
+    p_salida           := null;
+    p_mensaje          := null;
+    l_filas_eliminadas := 0;
+  
+    /* Eliminacion de datos de carga temporal */
+    open c_eliminar;
+    l_filas_borradas := 0;
+    loop
+      fetch c_eliminar bulk collect
+        into fles_rowid limit l_array_size;
+      exit when c_eliminar%notfound;
+      forall i in 1 .. fles_rowid.count save exceptions
+        delete from tmp_dw_saldo_doc where rowid = fles_rowid(i);
+      l_filas_borradas   := l_filas_borradas + fles_rowid.count;
+      l_filas_eliminadas := l_filas_borradas + l_filas_eliminadas;
+      if l_filas_borradas >= 10000 then
+        commit;
+        l_filas_borradas := 0;
+      end if;
+    end loop;
+    commit;
+    close c_eliminar;
+  
+    /* Carga de datos tabla temporal */
+    open c_poblar;
+    loop
+      fetch c_poblar bulk collect
+        into lr_datos limit 4000;
+    
+      begin
+        forall i in 1 .. lr_datos.count save exceptions
+          insert into tmp_dw_saldo_doc values lr_datos (i);
+        l_filas_insertadas := l_filas_insertadas + fles_rowid.count;
+        commit;
+      exception
+        when others then
+          dbms_output.put_line(sqlerrm);
+      end;
+    
+      exit when c_poblar%notfound;
+    end loop;
+    commit;
+    close c_poblar;
+    p_salida := l_filas_insertadas;
+  
+    select a.id_patrimonio
+      into l_id_patrimonio
+      from dim_patrimonio a
+     where a.rut_securitizadora = p_securitizadora
+       and rut_adm_primario = p_administrador
+       and rut_patrimonio = p_patrimonio;
+  
+    delete from fact_matriz_transicion
+     where id_fecha = p_fecha
+       and id_patrimonio = l_id_patrimonio;
+  
+    dbms_output.put_line(' GENERACION MATRIZ DE TRANSICION   ');
+    for x in c_dw_saldos_doc loop
+      l_error := 0;
+    
+      if l_error = 0 then
+        begin
+          insert into fact_matriz_transicion
+            (id_fecha,
+             id_patrimonio,
+             id_rngo_mora,
+             id_estado_activo,
+             id_emisor,
+             id_veces_repactado,
+             numero_creditos,
+             doc_vigentes,
+             val_cred_decaen,
+             val_cred_mantienen,
+             val_cred_mejoran)
+          values
+            (x.id_fecha,
+             x.id_patrimonio,
+             x.id_rango_ant,
+             1,
+             13,
+             0,
+             x.numero_creditos,
+             x.doc_vigentes,
+             x.val_cred_decaen,
+             x.val_cred_mantienen,
+             x.val_cred_mejoran);
+          l_insertados := l_insertados + 1;
+        exception
+          when dup_val_on_index then
+            l_actualiza := l_actualiza + 1;
+          when others then
+            l_errores := l_errores + 1;
+            dbms_output.put_line('  ' || to_char(sqlcode) || ' --- ' || sqlerrm);
+        end;
+      else
+        l_errores := l_errores + 1;
+      end if;
+    end loop;
+  
+    if l_datos = -1 then
+      dbms_output.put_line('***********************************************');
+      dbms_output.put_line(' NO EXISTE ESTADO DE ACTIVO EN LA TABLA DE DIMENSIONES  ');
+      dbms_output.put_line('***********************************************');
+    elsif l_datos = -4 then
+      dbms_output.put_line('***********************************************');
+      dbms_output.put_line(' NO EXISTE MONEDA ORIGEN  EN TABLA DE DIMENSIONES');
+      dbms_output.put_line('***********************************************');
+    end if;
+    commit;
+  
+    dbms_output.put_line('***********************************************');
+    dbms_output.put_line(' GENERACION MATRIZ DE TRANSICION FINALIZADA CON EXITO ' || p_fecha);
+    dbms_output.put_line(' REGISTROS INSERTADOS :' || l_insertados);
+    dbms_output.put_line(' REGISTROS CON ERROR :' || l_errores);
+    dbms_output.put_line('***********************************************');
+  
+  exception
+    when others then
+      p_mensaje := sqlerrm;
+      p_salida  := sqlcode;
+      dbms_output.put_line('MATRIZ DE TRANSICION PROCESO EJECUTADO CON ERRORES  ');
+      commit;
+  end;
