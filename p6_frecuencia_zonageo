@@ -1,0 +1,202 @@
+procedure p6_frecuencia_zonageo(p_securitizadora in number,
+                                  p_administrador  in number,
+                                  p_patrimonio     in number,
+                                  p_fecha          in number,
+                                  p_salida         in out number,
+                                  p_mensaje        in out varchar2) is
+    pragma autonomous_transaction;
+  
+    l_id_patrimonio  number;
+    l_eliminados     number := 0;
+    l_insertados     number := 0;
+    l_dim_insertados number := 0;
+    l_inicio         timestamp;
+    l_fin            timestamp;
+  
+  begin
+    l_inicio  := systimestamp;
+    p_salida  := 0;
+    p_mensaje := null;
+  
+    dbms_output.put_line('===============================================');
+    dbms_output.put_line('    BI-FRECUENCIA ZONA GEOGRÁFICA');
+    dbms_output.put_line('===============================================');
+    dbms_output.put_line('Fecha/Hora inicio: ' || to_char(l_inicio, 'dd-mm-yyyy hh24:mi:ss'));
+    dbms_output.put_line('Parámetros:');
+    dbms_output.put_line('  - Securitizadora: ' || p_securitizadora);
+    dbms_output.put_line('  - Administrador: ' || p_administrador);
+    dbms_output.put_line('  - Patrimonio: ' || p_patrimonio);
+    dbms_output.put_line('  - Fecha: ' || p_fecha);
+    dbms_output.put_line('-----------------------------------------------');
+  
+    -- ============================================================
+    -- PASO 1: Obtener ID del patrimonio
+    -- ============================================================
+    begin
+      select pat.id_patrimonio
+        into l_id_patrimonio
+        from dim_patrimonio pat
+       where pat.rut_securitizadora = p_securitizadora
+         and pat.rut_patrimonio = p_patrimonio
+         and pat.rut_adm_primario = p_administrador
+         and rownum = 1;
+    
+      dbms_output.put_line('ID Patrimonio: ' || l_id_patrimonio);
+    
+    exception
+      when no_data_found then
+        p_salida  := -1;
+        p_mensaje := 'No se encontró patrimonio para los parámetros ingresados';
+        dbms_output.put_line('ERROR: ' || p_mensaje);
+        rollback;
+        return;
+    end;
+  
+    -- ============================================================
+    -- PASO 2: Actualizar dimensión de frecuencia (si es necesario)
+    -- ============================================================
+    dbms_output.put_line('Verificando nuevas zonas geográficas...');
+  
+    begin
+      insert into dim_frecuencia
+        (id_rngo_frecuencia, desc_corta_rango, desc_rango, id_tipo_frecuencia)
+        select zona.id_zona_geografica + 6000, zona.nom_localidad, initcap(zona.nom_localidad), 6
+          from dim_zona_geografica zona
+         where not exists (select 1 from dim_frecuencia frec where frec.desc_corta_rango = zona.nom_localidad);
+    
+      l_dim_insertados := sql%rowcount;
+    
+      if l_dim_insertados > 0 then
+        dbms_output.put_line('Nuevas zonas agregadas a dim_frecuencia: ' || l_dim_insertados);
+        commit; -- Commit separado para la dimensión
+      else
+        dbms_output.put_line('No hay nuevas zonas para agregar');
+      end if;
+    
+    exception
+      when others then
+        dbms_output.put_line('ADVERTENCIA: Error al actualizar dim_frecuencia: ' || sqlerrm);
+        -- No detenemos el proceso, continuamos
+    end;
+  
+    -- ============================================================
+    -- PASO 3: Eliminar datos existentes
+    -- ============================================================
+    delete from fact_frecuencia_zonageo
+     where id_fecha = p_fecha
+       and id_patrimonio = l_id_patrimonio;
+  
+    l_eliminados := sql%rowcount;
+    dbms_output.put_line('Registros eliminados de fact: ' || l_eliminados);
+  
+    -- ============================================================
+    -- PASO 4: Insertar nuevos datos (INSERT DIRECTO)
+    -- ============================================================
+    insert into fact_frecuencia_zonageo
+      (id_fecha,
+       id_patrimonio,
+       id_zona_geo,
+       id_estado_securitizado,
+       id_transaccion,
+       id_rngo_mora,
+       id_tipo_moneda,
+       id_tipo_cartera,
+       cant_creditos,
+       saldo_final,
+       plazo_remanente,
+       plazo)
+      select sal.fecha_key,
+             l_id_patrimonio,
+             dim.id_zona_geografica,
+             2, -- id_estado_securitizado
+             c.id_transaccion,
+             sal.rango_mora,
+             sal.id_tipo_moneda,
+             sal.tipo_cartera,
+             -- cant_creditos
+             case
+               when sal.sec_rut = 96858720 and sal.adp_rut = 120427162 then
+                sum(cred_final)
+               when c.id_transaccion = 14 then
+                sum(sal.cred_alta + sal.cred_revivido)
+               else
+                0
+             end,
+             -- saldo_final
+             sum(case
+                   when c.id_transaccion <> 14 then
+                    sal.sdm_saldo_final
+                   else
+                    0
+                 end),
+             -- plazo_remanente
+             round(avg(case
+                         when c.id_transaccion = 14 then
+                          (sdm_fecha_cierre - neg_fecha_emision) / 365.25
+                         else
+                          null
+                       end),
+                   2),
+             -- plazo
+             round(max(case
+                         when c.id_transaccion = 14 then
+                          (sdm_fecha_cierre - neg_fecha_emision) / 365.25
+                         else
+                          null
+                       end),
+                   2)
+        from dw_saldo_documental sal
+       inner join dim_transaccion c on sal.desc_tx_interna = c.desc_transaccion
+       inner join dim_zona_geografica dim on sal.desc_local_apertura = dim.nom_localidad
+       where sal.sec_rut = p_securitizadora
+         and sal.adp_rut = p_administrador
+         and sal.pat_rut = p_patrimonio
+         and sal.fecha_key = p_fecha
+       group by sal.fecha_key,
+                dim.id_zona_geografica,
+                c.id_transaccion,
+                sal.rango_mora,
+                sal.id_tipo_moneda,
+                sal.tipo_cartera,
+                sal.sec_rut,
+                sal.adp_rut
+       order by 1, 2, 3, 4, 5, 6, 7;
+  
+    l_insertados := sql%rowcount;
+  
+    -- Commit final
+    commit;
+  
+    l_fin := systimestamp;
+  
+    -- ============================================================
+    -- PASO 5: Mensajes de salida
+    -- ============================================================
+    dbms_output.put_line('-----------------------------------------------');
+    dbms_output.put_line('REGISTROS ELIMINADOS: ' || l_eliminados);
+    dbms_output.put_line('REGISTROS INSERTADOS: ' || l_insertados);
+    if l_dim_insertados > 0 then
+      dbms_output.put_line('NUEVAS ZONAS EN DIMENSIÓN: ' || l_dim_insertados);
+    end if;
+    dbms_output.put_line('Tiempo ejecución: ' || round(extract(second from(l_fin - l_inicio)), 2) || ' segundos');
+    dbms_output.put_line('===============================================');
+    dbms_output.put_line('PROCESO FINALIZADO EXITOSAMENTE');
+    dbms_output.put_line('===============================================');
+  
+    p_salida  := l_insertados;
+    p_mensaje := 'Cargada Fact-Frecuencia-Zona Geográfica: ' || l_insertados || ' registros';
+  
+  exception
+    when others then
+      rollback;
+      p_salida  := sqlcode;
+      p_mensaje := 'ERROR: ' || sqlerrm;
+      dbms_output.put_line('===============================================');
+      dbms_output.put_line('ERROR EN BI-FRECUENCIA ZONA GEOGRÁFICA');
+      dbms_output.put_line('===============================================');
+      dbms_output.put_line('PERIODO: ' || p_fecha);
+      dbms_output.put_line('SQLCODE: ' || sqlcode);
+      dbms_output.put_line('SQLERRM: ' || sqlerrm);
+      dbms_output.put_line('===============================================');
+    
+  end p6_frecuencia_zonageo;
